@@ -9,9 +9,10 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 
-from scan_ips import PRESETS, PORT_TAGS, Progress, main, scan_ip, scan_selection, select_ports, tcp_results
+from scan_ips import (PRESETS, PORT_TAGS, Progress, ensure_requirements, find_nmap,
+                      installation_commands, main, scan_ip, scan_selection, select_ports, tcp_results)
 
 
 def scan_xml(state="closed", reason="conn-refused"):
@@ -21,6 +22,84 @@ def scan_xml(state="closed", reason="conn-refused"):
 
 
 class ScanTests(unittest.TestCase):
+    def test_linux_install_commands_and_privilege_handling(self):
+        for distro, manager in (("debian", "apt-get"), ("ubuntu", "apt-get"),
+                                ("fedora", "dnf"), ("arch", "pacman")):
+            for uid in (0, 1000):
+                with self.subTest(distro=distro, uid=uid):
+                    with patch("scan_ips.sys.platform", "linux"), patch("scan_ips.os.geteuid", return_value=uid):
+                        with patch("scan_ips.open", mock_open(read_data=f'ID="{distro}"\n')):
+                            with patch("scan_ips.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"):
+                                commands = installation_commands()
+                    self.assertEqual(commands[-1][-1], "nmap")
+                    self.assertEqual(commands[-1][0], "sudo" if uid else manager)
+                    self.assertEqual(len(commands), 2 if manager == "apt-get" else 1)
+
+    def test_macos_and_windows_install_commands(self):
+        with patch("scan_ips.sys.platform", "darwin"), patch("scan_ips.os.geteuid", return_value=1000):
+            with patch("scan_ips.shutil.which", return_value="/opt/homebrew/bin/brew"):
+                self.assertEqual(installation_commands(), [["/opt/homebrew/bin/brew", "install", "nmap"]])
+                with patch("scan_ips.os.geteuid", return_value=0), patch.dict(os.environ, {"SUDO_USER": "tester"}):
+                    self.assertEqual(installation_commands()[0][:3], ["sudo", "-u", "tester"])
+        with patch("scan_ips.sys.platform", "win32"), patch("scan_ips.shutil.which", return_value="winget.exe"):
+            command = installation_commands(repair=True)[0]
+            self.assertIn("Insecure.Nmap", command)
+            self.assertIn("--interactive", command)
+            self.assertIn("--force", command)
+
+    def test_dependency_installation_verification_and_path_refresh(self):
+        with patch("scan_ips.find_nmap", side_effect=[None, "/installed/bin/nmap"]):
+            with patch("scan_ips.sys.platform", "linux"), patch("scan_ips.installation_commands", return_value=[["installer", "nmap"]]):
+                with patch("scan_ips.subprocess.run") as run, patch.dict(os.environ, {"PATH": "/usr/bin"}):
+                    with redirect_stderr(io.StringIO()):
+                        self.assertEqual(ensure_requirements(), "/installed/bin/nmap")
+                    self.assertEqual(run.call_count, 2)
+                    self.assertEqual(run.call_args_list[0].args[0], ["installer", "nmap"])
+                    self.assertEqual(run.call_args_list[1].args[0], ["/installed/bin/nmap", "--version"])
+                    self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], "/installed/bin")
+
+    def test_installed_nmap_is_not_reinstalled(self):
+        with patch("scan_ips.find_nmap", return_value="nmap"), patch("scan_ips.sys.platform", "linux"):
+            with patch("scan_ips.subprocess.run") as run:
+                self.assertEqual(ensure_requirements(), "nmap")
+                run.assert_not_called()
+
+    def test_windows_npcap_repair_for_raw_scans(self):
+        with patch("scan_ips.sys.platform", "win32"), patch("scan_ips.find_nmap", return_value="nmap.exe"):
+            with patch("scan_ips.npcap_installed", side_effect=[False, True]):
+                with patch("scan_ips.installation_commands", return_value=[["winget", "install"]]) as install:
+                    with patch("scan_ips.subprocess.run"), redirect_stderr(io.StringIO()):
+                        ensure_requirements(raw_packets=True)
+                    install.assert_called_once_with(repair=True)
+
+    def test_dependency_failures_stop_before_scan(self):
+        for problem in (RuntimeError("no package manager"), OSError("installation failed"),
+                        subprocess.CalledProcessError(1, ["installer"])):
+            with patch("scan_ips.ensure_requirements", side_effect=problem):
+                with patch("scan_ips.open") as output, redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        main(["192.0.2.1/32"])
+                    self.assertEqual(error.exception.code, 2)
+                    output.assert_not_called()
+        with patch("scan_ips.find_nmap", return_value=None), patch("scan_ips.sys.platform", "linux"):
+            with patch("scan_ips.installation_commands", return_value=[["installer"]]), patch("scan_ips.subprocess.run"):
+                with redirect_stderr(io.StringIO()), self.assertRaisesRegex(RuntimeError, "not found"):
+                    ensure_requirements()
+
+    def test_missing_package_manager_and_unsupported_os(self):
+        for platform in ("darwin", "win32", "freebsd"):
+            with patch("scan_ips.sys.platform", platform), patch("scan_ips.shutil.which", return_value=None):
+                with patch("scan_ips.os.path.isfile", return_value=False), self.assertRaises(RuntimeError):
+                    installation_commands()
+        with patch("scan_ips.sys.platform", "linux"), patch("scan_ips.open", mock_open(read_data="ID=unsupported\n")):
+            with self.assertRaisesRegex(RuntimeError, "unsupported Linux"):
+                installation_commands()
+
+    def test_nmap_discovered_outside_windows_path(self):
+        with patch("scan_ips.sys.platform", "win32"), patch("scan_ips.shutil.which", return_value=None):
+            with patch("scan_ips.os.path.isfile", return_value=True), patch("scan_ips.os.access", return_value=True):
+                self.assertTrue(find_nmap().endswith("nmap.exe"))
+
     def test_presets_and_ranges(self):
         self.assertEqual(select_ports([], None), [22])
         self.assertEqual(select_ports(["ssh,nginx", "grafana"], "22,3000-3001"),

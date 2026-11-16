@@ -1,6 +1,7 @@
 # TCP IP inventory
 
-Python 3.9+ and `nmap` on PATH; no Python packages required.
+Python 3.9+ is required to start the script; no pip packages are needed.
+Missing nmap is installed automatically using the OS package manager.
 Default TCP connect scans run without root. The `fast` and `deep` tags require sudo
 on macOS/Linux for raw-packet access.
 
@@ -23,6 +24,42 @@ no ICMP host discovery, and no separate nmap ARP discovery. The OS may still nee
 ARP to establish connections. Python performs reverse DNS using your system
 resolver. Default scans send no application data. Deep scans actively probe
 services and allow TCP/UDP/ICMP OS fingerprinting as described below.
+
+## Automatic dependency setup
+
+Before scanning, the script checks for nmap on PATH and in standard macOS/Windows
+install folders. An existing installation is reused. Otherwise it runs:
+
+- macOS: `brew install nmap`.
+- Debian/Ubuntu: `apt-get update`, then `apt-get install -y nmap`.
+- Fedora: `dnf install -y nmap`.
+- Arch: `pacman -S --needed --noconfirm nmap`.
+- Windows: `winget install --id Insecure.Nmap --exact --source winget --interactive`.
+
+Linux installations use sudo when not already root. Password prompts can appear.
+When the script runs through sudo on macOS, Homebrew runs as the original user
+from `SUDO_USER`, since Homebrew cannot install packages as root.
+
+Homebrew or WinGet must already be available; the script gives setup guidance if
+they are missing. It does not bootstrap package managers or replace the Python
+interpreter running it. Linux dependencies come from the configured repositories.
+Package installations can need network access and privileges. Installer commands
+and output are shown; failures stop before report creation or scanning.
+
+After installing, the script finds nmap again, verifies `nmap --version`, and adds
+its directory to this process's PATH, allowing scanning to continue without a new
+terminal. It does not change your persistent shell/system PATH itself.
+
+Windows may show installer, license, and UAC dialogs. Leave Npcap selected in the
+Nmap installer: raw-packet scans need it. For `fast`/`deep`, a missing Npcap driver
+triggers an interactive Nmap reinstall (`--force`), followed by another driver
+check. Driver-file presence does not verify driver/service operation. Run raw scans
+from an elevated terminal if your Npcap installation requires it. Ordinary TCP
+connect scans with `-sT -Pn` can work without Npcap, except for Windows loopback
+limitations. Dependencies such as the Visual C++ runtime are handled by the Nmap
+installer. See [Nmap on Windows](https://nmap.org/book/inst-windows.html),
+[WinGet install](https://learn.microsoft.com/en-us/windows/package-manager/winget/install),
+and [Homebrew nmap](https://formulae.brew.sh/formula/nmap).
 
 ## Progress and verbosity
 
@@ -274,3 +311,5 @@ fields, NSE result preservation, error classification, and a real localhost TCP
 connect scan, plus progress rendering, heartbeat updates, verbosity levels, and
 out-of-order host completion. SYN, OS fingerprint, and vulnerability commands are tested with
 fixtures; no external network is scanned and no vulnerability scripts are executed.
+OS installation paths, privilege handling, dependency failures, Windows Npcap
+repair, and PATH refresh are tested with mocks; package installations are not run.

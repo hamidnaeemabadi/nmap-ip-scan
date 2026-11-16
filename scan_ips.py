@@ -20,6 +20,91 @@ from datetime import datetime
 from itertools import groupby, islice
 
 
+def find_nmap():
+    executable = shutil.which("nmap")
+    if executable:
+        return executable
+    candidates = []
+    if sys.platform == "darwin":
+        candidates = ["/opt/homebrew/bin/nmap", "/usr/local/bin/nmap"]
+    elif sys.platform == "win32":
+        candidates = [os.path.join(os.environ.get(key, fallback), "Nmap", "nmap.exe")
+                      for key, fallback in (("ProgramFiles", r"C:\Program Files"),
+                                            ("ProgramFiles(x86)", r"C:\Program Files (x86)"))]
+    return next((path for path in candidates if os.path.isfile(path) and os.access(path, os.X_OK)), None)
+
+
+def npcap_installed():
+    return os.path.isfile(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                       "System32", "drivers", "npcap.sys"))
+
+
+def installation_commands(repair=False):
+    if sys.platform == "darwin":
+        brew = shutil.which("brew") or next((path for path in
+               ("/opt/homebrew/bin/brew", "/usr/local/bin/brew") if os.path.isfile(path)), None)
+        if not brew:
+            raise RuntimeError("Homebrew is required for automatic installation; install it from https://brew.sh and retry")
+        command = [brew, "install", "nmap"]
+        if os.geteuid() == 0:
+            user = os.environ.get("SUDO_USER")
+            if not user or user == "root":
+                raise RuntimeError("Homebrew cannot install as root; run brew install nmap as your normal user first")
+            command = ["sudo", "-u", user, *command]
+        return [command]
+    if sys.platform.startswith("linux"):
+        with open("/etc/os-release", encoding="utf-8") as release:
+            distro = next((line.partition("=")[2].strip().strip('"')
+                           for line in release if line.startswith("ID=")), "")
+        commands = {
+            "debian": [["apt-get", "update"], ["apt-get", "install", "-y", "nmap"]],
+            "ubuntu": [["apt-get", "update"], ["apt-get", "install", "-y", "nmap"]],
+            "fedora": [["dnf", "install", "-y", "nmap"]],
+            "arch": [["pacman", "-S", "--needed", "--noconfirm", "nmap"]],
+        }.get(distro)
+        if commands is None:
+            raise RuntimeError(f"unsupported Linux distribution: {distro or 'unknown'}; install nmap manually")
+        if not shutil.which(commands[0][0]):
+            raise RuntimeError(f"required package manager {commands[0][0]} is unavailable")
+        if os.geteuid() != 0:
+            if not shutil.which("sudo"):
+                raise RuntimeError("sudo is unavailable; install nmap as root and retry")
+            commands = [["sudo", *command] for command in commands]
+        return commands
+    if sys.platform == "win32":
+        winget = shutil.which("winget")
+        if not winget:
+            raise RuntimeError("WinGet is required for automatic installation; install App Installer from Microsoft, "
+                               "or install Nmap with Npcap from https://nmap.org/download.html")
+        command = [winget, "install", "--id", "Insecure.Nmap", "--exact", "--source", "winget", "--interactive"]
+        if repair:
+            command.append("--force")
+        return [command]
+    raise RuntimeError(f"unsupported OS: {sys.platform}; install nmap manually")
+
+
+def ensure_requirements(raw_packets=False):
+    if sys.version_info < (3, 9):
+        raise RuntimeError("Python 3.9+ is required; upgrade Python and rerun the script")
+    executable = find_nmap()
+    repair = sys.platform == "win32" and raw_packets and not npcap_installed()
+    if executable is None or repair:
+        print("Installing missing Nmap/Npcap requirements. Package manager or OS prompts may appear.", file=sys.stderr)
+        for command in installation_commands(repair=bool(executable and repair)):
+            print(f"Running: {shlex.join(command)}", file=sys.stderr, flush=True)
+            subprocess.run(command, check=True, stdout=sys.stderr)
+        executable = find_nmap()
+        if executable is None:
+            raise RuntimeError("installation finished but nmap was not found; add its install directory to PATH and retry")
+        subprocess.run([executable, "--version"], check=True, stdout=sys.stderr)
+        if repair and not npcap_installed():
+            raise RuntimeError("Npcap is still missing; rerun the Nmap installer and enable Npcap")
+    directory = os.path.dirname(executable)
+    if directory:
+        os.environ["PATH"] = directory + os.pathsep + os.environ.get("PATH", "")
+    return executable
+
+
 FIELDS = ("ip", "status", "reverse_dns", "tcp_open", "tcp_refused", "tcp_timeout", "errors",
           "service_details", "os_detection", "script_results")
 
@@ -326,10 +411,12 @@ def main(argv=None):
             raise ValueError("scan a /16 or smaller network at a time")
     except ValueError as exc:
         parser.error(str(exc))
-    if shutil.which("nmap") is None:
-        parser.error("nmap is required; install it and ensure it is on PATH")
     if mode in ("fast", "deep") and hasattr(os, "geteuid") and os.geteuid() != 0:
         parser.error(f"the {mode} tag requires raw-packet privileges; run this command with sudo")
+    try:
+        ensure_requirements(raw_packets=mode in ("fast", "deep"))
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        parser.error(f"dependency setup failed: {exc}")
     try:
         if args.output is None:
             os.makedirs("scan-reports", exist_ok=True)
